@@ -68,29 +68,31 @@ public sealed class AgentEvaluationResults
     /// </summary>
     public IReadOnlyList<EvalItemResult>? DetailedItems { get; set; }
 
-    /// <summary>Gets the number of items that passed.</summary>
-    public int Passed => this._items.Count(ItemPassed);
+    /// <summary>
+    /// Gets the number of items that passed, including items in <see cref="SubResults"/>.
+    /// Items without metrics are not counted as passed.
+    /// </summary>
+    public int Passed => this._items.Count(i => ItemEvaluated(i) && ItemPassed(i))
+        + (this.SubResults?.Values.Sum(s => s.Passed) ?? 0);
 
-    /// <summary>Gets the number of items that failed.</summary>
-    public int Failed => this._items.Count(i => !ItemPassed(i));
+    /// <summary>
+    /// Gets the number of items that failed, including items in <see cref="SubResults"/>.
+    /// Items without metrics are not counted as failed.
+    /// </summary>
+    public int Failed => this._items.Count(i => ItemEvaluated(i) && !ItemPassed(i))
+        + (this.SubResults?.Values.Sum(s => s.Failed) ?? 0);
 
-    /// <summary>Gets the total number of items evaluated.</summary>
-    public int Total => this._items.Count;
+    /// <summary>
+    /// Gets the total number of result items, including items in <see cref="SubResults"/>.
+    /// This includes items without metrics so they remain visible in the aggregate counts.
+    /// </summary>
+    public int Total => this._items.Count + (this.SubResults?.Values.Sum(s => s.Total) ?? 0);
 
-    /// <summary>Gets whether all items passed.</summary>
-    public bool AllPassed
-    {
-        get
-        {
-            if (this.SubResults is not null)
-            {
-                return this.SubResults.Values.All(s => s.AllPassed)
-                    && (this.Total == 0 || this.Failed == 0);
-            }
-
-            return this.Total > 0 && this.Failed == 0;
-        }
-    }
+    /// <summary>
+    /// Gets whether at least one result item exists and every result item passed.
+    /// Returns <see langword="false"/> when any item has no metrics.
+    /// </summary>
+    public bool AllPassed => this.Total > 0 && this.Passed == this.Total;
 
     /// <summary>
     /// Asserts that all items passed. Throws <see cref="InvalidOperationException"/> on failure.
@@ -125,14 +127,15 @@ public sealed class AgentEvaluationResults
     /// <remarks>
     /// <para>
     /// Designed for CI gates on generated rubric evaluators (for example
-    /// <c>results.AssertScoreAtLeast(0.80)</c>). Walks <see cref="DetailedItems"/> across this
-    /// result and any <see cref="SubResults"/> from workflow evaluations.
+    /// <c>results.AssertScoreAtLeast(0.80)</c>). Walks <see cref="DetailedItems"/> and numeric
+    /// metrics in <see cref="Items"/> across this result and any <see cref="SubResults"/> from
+    /// workflow evaluations.
     /// </para>
     /// <para>
-    /// When <see cref="DetailedItems"/> is <see langword="null"/>, the assertion is a no-op for
-    /// this level. Providers that surface per-evaluator scores (such as Foundry) populate
-    /// <see cref="DetailedItems"/>; providers that only emit aggregate <see cref="Items"/>
-    /// metrics do not.
+    /// Providers that surface detailed scores (such as Foundry) populate
+    /// <see cref="DetailedItems"/>. For other providers, each <see cref="NumericMetric"/> in
+    /// <see cref="Items"/> is treated as an evaluator score. The assertion throws when no
+    /// matching score is available so a score gate cannot pass without evaluating a score.
     /// </para>
     /// </remarks>
     /// <param name="minScore">Minimum acceptable score (inclusive).</param>
@@ -141,12 +144,20 @@ public sealed class AgentEvaluationResults
     /// </param>
     /// <param name="message">Optional custom failure message.</param>
     /// <exception cref="InvalidOperationException">
-    /// Thrown when any matching score is below the threshold.
+    /// Thrown when any matching score is below the threshold, or when no matching per-item
+    /// score is available.
     /// </exception>
     public void AssertScoreAtLeast(double minScore, string? evaluator = null, string? message = null)
     {
         var offenders = new List<string>();
-        CollectScoreOffenders(this, minScore, evaluator, offenders);
+        bool foundScore = CollectScoreOffenders(this, minScore, evaluator, offenders);
+
+        if (!foundScore)
+        {
+            throw new InvalidOperationException(
+                message ?? "Score assertion requires per-item numeric scores, but this evaluator did not provide any"
+                    + (evaluator is not null ? $" for '{evaluator}'." : "."));
+        }
 
         if (offenders.Count > 0)
         {
@@ -169,6 +180,8 @@ public sealed class AgentEvaluationResults
     /// to fail when no applicable score is produced for an item. If dimension data exists
     /// but the requested <paramref name="dimensionId"/> is never present, the assertion fails
     /// to surface likely typos or evaluator mismatches.
+    /// The assertion also fails when result items do not expose detailed dimension scores,
+    /// because aggregate metrics cannot provide equivalent dimension semantics.
     /// </remarks>
     /// <param name="dimensionId">Dimension id — matches the rubric definition.</param>
     /// <param name="minScore">Minimum acceptable dimension score (inclusive).</param>
@@ -181,7 +194,8 @@ public sealed class AgentEvaluationResults
     /// </param>
     /// <param name="message">Optional custom failure message.</param>
     /// <exception cref="InvalidOperationException">
-    /// Thrown when the dimension fails the threshold on any item.
+    /// Thrown when the dimension fails the threshold on any item, or when per-item dimension
+    /// scores are unavailable.
     /// </exception>
     public void AssertDimensionScoreAtLeast(
         string dimensionId,
@@ -195,8 +209,21 @@ public sealed class AgentEvaluationResults
         CollectDimensionOffenders(this, dimensionId, minScore, evaluator, requireApplicable, offenders, missing);
 
         var problems = new List<string>();
+        int itemsWithoutDetailedScores = CountItemsWithoutDetailedScores(this);
         bool hasAnyDimensionData = HasAnyDimensionData(this, evaluator);
-        if (hasAnyDimensionData && !HasDimension(this, dimensionId, evaluator))
+        if (itemsWithoutDetailedScores > 0)
+        {
+            problems.Add(
+                $"Dimension score assertion requires detailed per-item scores, but {itemsWithoutDetailedScores} item(s) did not provide them.");
+        }
+
+        if (!hasAnyDimensionData)
+        {
+            problems.Add(
+                "Dimension score assertion requires per-item dimension scores, but this evaluator did not provide any"
+                    + (evaluator is not null ? $" for '{evaluator}'." : "."));
+        }
+        else if (!HasDimension(this, dimensionId, evaluator))
         {
             problems.Add(
                 $"Dimension '{dimensionId}' was not found in results"
@@ -243,12 +270,13 @@ public sealed class AgentEvaluationResults
         }
     }
 
-    private static void CollectScoreOffenders(
+    private static bool CollectScoreOffenders(
         AgentEvaluationResults results,
         double minScore,
         string? evaluator,
         List<string> offenders)
     {
+        bool foundScore = false;
         if (results.DetailedItems is not null)
         {
             foreach (var item in results.DetailedItems)
@@ -260,9 +288,30 @@ public sealed class AgentEvaluationResults
                         continue;
                     }
 
+                    foundScore = true;
                     if (score.Score < minScore)
                     {
                         offenders.Add($"{item.ItemId}/{score.Name}={score.Score.ToString("F3", CultureInfo.InvariantCulture)}");
+                    }
+                }
+            }
+        }
+        else
+        {
+            for (int itemIndex = 0; itemIndex < results.Items.Count; itemIndex++)
+            {
+                foreach (var metric in results.Items[itemIndex].Metrics)
+                {
+                    if (metric.Value is not NumericMetric { Value: double score }
+                        || (evaluator is not null && metric.Key != evaluator))
+                    {
+                        continue;
+                    }
+
+                    foundScore = true;
+                    if (score < minScore)
+                    {
+                        offenders.Add($"item-{itemIndex + 1}/{metric.Key}={score.ToString("F3", CultureInfo.InvariantCulture)}");
                     }
                 }
             }
@@ -272,9 +321,11 @@ public sealed class AgentEvaluationResults
         {
             foreach (var sub in results.SubResults.Values)
             {
-                CollectScoreOffenders(sub, minScore, evaluator, offenders);
+                foundScore |= CollectScoreOffenders(sub, minScore, evaluator, offenders);
             }
         }
+
+        return foundScore;
     }
 
     private static void CollectDimensionOffenders(
@@ -439,6 +490,17 @@ public sealed class AgentEvaluationResults
         return false;
     }
 
+    private static int CountItemsWithoutDetailedScores(AgentEvaluationResults results)
+    {
+        int count = results.DetailedItems is null ? results.Items.Count : 0;
+        if (results.SubResults is not null)
+        {
+            count += results.SubResults.Values.Sum(CountItemsWithoutDetailedScores);
+        }
+
+        return count;
+    }
+
     private static string FormatOffenders(string prefix, List<string> offenders)
     {
         const int MaxShown = 5;
@@ -471,6 +533,8 @@ public sealed class AgentEvaluationResults
             // the evaluator should set Interpretation if it wants pass/fail semantics.
         }
 
-        return result.Metrics.Count > 0;
+        return true;
     }
+
+    private static bool ItemEvaluated(EvaluationResult result) => result.Metrics.Count > 0;
 }

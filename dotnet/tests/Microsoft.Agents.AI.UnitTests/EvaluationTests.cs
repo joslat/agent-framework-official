@@ -150,18 +150,20 @@ public sealed class EvaluationTests
     }
 
     [Fact]
-    public async Task LocalEvaluator_WithZeroChecks_ItemsHaveZeroMetricsAndFailAsync()
+    public async Task LocalEvaluator_WithZeroChecks_ItemsAreNotEvaluatedAsync()
     {
-        // A LocalEvaluator with no checks produces items with 0 metrics.
-        // Items with 0 metrics count as failed (the Metrics.Count > 0 guard in ItemPassed).
+        // Arrange: a LocalEvaluator with no checks produces items with no metrics.
         var evaluator = new LocalEvaluator();
         var items = new List<EvalItem> { CreateItem(response: "anything") };
 
+        // Act
         var results = await evaluator.EvaluateAsync(items);
 
+        // Assert: the item remains visible in Total without being reported as a model failure.
         Assert.Equal(1, results.Total);
         Assert.Equal(0, results.Passed);
-        Assert.Equal(1, results.Failed);
+        Assert.Equal(0, results.Failed);
+        Assert.False(results.AllPassed);
         var item = Assert.Single(results.Items);
         Assert.Empty(item.Metrics);
     }
@@ -548,6 +550,38 @@ public sealed class EvaluationTests
 
         // Assert
         Assert.False(results.AllPassed);
+        Assert.Equal(1, results.Passed);
+        Assert.Equal(1, results.Failed);
+        Assert.Equal(2, results.Total);
+    }
+
+    [Fact]
+    public void AgentEvaluationResults_CountsIncludeNestedSubResults()
+    {
+        // Arrange
+        var failedMetric = new BooleanMetric("check", false)
+        {
+            Interpretation = new EvaluationMetricInterpretation
+            {
+                Rating = EvaluationRating.Unacceptable,
+                Failed = true,
+            },
+        };
+        var leaf = new AgentEvaluationResults("leaf", [new EvaluationResult(failedMetric)]);
+        var child = new AgentEvaluationResults("child", Array.Empty<EvaluationResult>())
+        {
+            SubResults = new Dictionary<string, AgentEvaluationResults> { ["leaf"] = leaf },
+        };
+        var parent = new AgentEvaluationResults("workflow", Array.Empty<EvaluationResult>())
+        {
+            SubResults = new Dictionary<string, AgentEvaluationResults> { ["child"] = child },
+        };
+
+        // Act & Assert
+        Assert.Equal(0, parent.Passed);
+        Assert.Equal(1, parent.Failed);
+        Assert.Equal(1, parent.Total);
+        Assert.False(parent.AllPassed);
     }
 
     // ---------------------------------------------------------------
@@ -729,6 +763,35 @@ public sealed class EvaluationTests
     }
 
     [Fact]
+    public async Task AssertScoreAtLeast_LocalNumericMetricBelowThreshold_ThrowsAsync()
+    {
+        // Arrange
+        var evaluator = new NumericScoreEvaluator(0.2);
+        var adapter = new MeaiEvaluatorAdapter(evaluator, new ChatConfiguration(new StubChatClient()));
+
+        // Act
+        AgentEvaluationResults results = await adapter.EvaluateAsync([CreateItem()]);
+
+        // Assert
+        var ex = Assert.Throws<InvalidOperationException>(() => results.AssertScoreAtLeast(0.8));
+        Assert.Contains("quality", ex.Message);
+        Assert.Contains("0.200", ex.Message);
+    }
+
+    [Fact]
+    public void AssertScoreAtLeast_WithoutNumericScores_Throws()
+    {
+        // Arrange
+        var results = new AgentEvaluationResults(
+            "local",
+            [new EvaluationResult(new BooleanMetric("check", true))]);
+
+        // Act & Assert
+        var ex = Assert.Throws<InvalidOperationException>(() => results.AssertScoreAtLeast(0.8));
+        Assert.Contains("requires per-item numeric scores", ex.Message);
+    }
+
+    [Fact]
     public void AssertDimensionScoreAtLeast_AboveThreshold_DoesNotThrow()
     {
         // Arrange
@@ -835,6 +898,20 @@ public sealed class EvaluationTests
             () => results.AssertDimensionScoreAtLeast("typo_dimension", 3.0));
         Assert.Contains("typo_dimension", ex.Message);
         Assert.Contains("not found", ex.Message);
+    }
+
+    [Fact]
+    public void AssertDimensionScoreAtLeast_WithoutDetailedScores_Throws()
+    {
+        // Arrange
+        var results = new AgentEvaluationResults(
+            "local",
+            [new EvaluationResult(new NumericMetric("quality", 0.9))]);
+
+        // Act & Assert
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => results.AssertDimensionScoreAtLeast("clarity", 0.8));
+        Assert.Contains("requires detailed per-item scores", ex.Message);
     }
 
     [Fact]
@@ -1328,11 +1405,20 @@ public sealed class EvaluationTests
     // ---------------------------------------------------------------
 
     [Fact]
-    public void AllPassed_EmptyItems_NoSubResults_ReturnsFalseAsync()
+    public void AllPassed_EmptyLeafAndEmptyParent_ReturnFalse()
     {
-        var results = new AgentEvaluationResults("test", Array.Empty<EvaluationResult>());
-        Assert.False(results.AllPassed);
-        Assert.Equal(0, results.Total);
+        // Arrange
+        var leaf = new AgentEvaluationResults("leaf", Array.Empty<EvaluationResult>());
+        var parent = new AgentEvaluationResults("parent", Array.Empty<EvaluationResult>())
+        {
+            SubResults = new Dictionary<string, AgentEvaluationResults>(),
+        };
+
+        // Act & Assert
+        Assert.False(leaf.AllPassed);
+        Assert.False(parent.AllPassed);
+        Assert.Equal(0, leaf.Total);
+        Assert.Equal(0, parent.Total);
     }
 
     [Fact]
@@ -1508,13 +1594,36 @@ public sealed class EvaluationTests
     }
 
     [Fact]
-    public void ContainsExpected_FailsWhenNoExpectedOutput()
+    public void ContainsExpected_PassesAsSkippedWhenNoExpectedOutput()
     {
+        // Arrange
         var check = EvalChecks.ContainsExpected();
         var item = new EvalItem(query: "hello", response: "world");
+
+        // Act
         var result = check(item);
-        Assert.False(result.Passed);
-        Assert.Contains("not set", result.Reason, StringComparison.OrdinalIgnoreCase);
+
+        // Assert
+        Assert.True(result.Passed);
+        Assert.Contains("skipped", result.Reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ContainsExpected_PassesAsSkippedWhenExpectedOutputIsEmpty()
+    {
+        // Arrange
+        var check = EvalChecks.ContainsExpected();
+        var item = new EvalItem(query: "hello", response: "world")
+        {
+            ExpectedOutput = string.Empty,
+        };
+
+        // Act
+        var result = check(item);
+
+        // Assert
+        Assert.True(result.Passed);
+        Assert.Contains("skipped", result.Reason, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -1904,6 +2013,23 @@ public sealed class EvaluationTests
             this.Calls.Add((messages.ToList(), modelResponse, chatConfiguration!));
             var result = new EvaluationResult(new BooleanMetric("stub_check", true));
             return new ValueTask<EvaluationResult>(result);
+        }
+    }
+
+    /// <summary>Stub IEvaluator that returns a fixed numeric score.</summary>
+    private sealed class NumericScoreEvaluator(double score) : IEvaluator
+    {
+        public IReadOnlyCollection<string> EvaluationMetricNames { get; } = ["quality"];
+
+        public ValueTask<EvaluationResult> EvaluateAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatResponse modelResponse,
+            ChatConfiguration? chatConfiguration = null,
+            IEnumerable<EvaluationContext>? additionalContext = null,
+            CancellationToken cancellationToken = default)
+        {
+            return new ValueTask<EvaluationResult>(
+                new EvaluationResult(new NumericMetric("quality", score)));
         }
     }
 

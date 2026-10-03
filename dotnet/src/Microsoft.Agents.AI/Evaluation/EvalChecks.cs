@@ -219,6 +219,10 @@ public static class EvalChecks
     /// <summary>
     /// Creates a check that verifies the response contains the expected output text.
     /// </summary>
+    /// <remarks>
+    /// If no expected output is set on the item, the check is skipped and passes, matching
+    /// the missing-expectation behavior of <see cref="ToolCallArgsMatch"/>.
+    /// </remarks>
     /// <param name="caseSensitive">Whether the comparison is case-sensitive (default false).</param>
     /// <returns>An <see cref="EvalCheck"/> delegate.</returns>
     public static EvalCheck ContainsExpected(bool caseSensitive = false)
@@ -227,7 +231,7 @@ public static class EvalChecks
         {
             if (string.IsNullOrEmpty(item.ExpectedOutput))
             {
-                return new EvalCheckResult(false, "ExpectedOutput is not set; check cannot be applied.", "contains_expected");
+                return new EvalCheckResult(true, "ExpectedOutput is not set; check was skipped.", "contains_expected");
             }
 
             var comparison = caseSensitive
